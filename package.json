@@ -1,0 +1,28 @@
+{
+  "name": "arnold",
+  "version": "0.23.0",
+  "description": "Multi-model intelligence systems and Megaplan planning harness",
+  "author": "Abdullah Formuli <authrainmedia@gmail.com> (https://github.com/authrain-cloud-abdullahformuli)",
+  "license": "Apache-2.0",
+  "homepage": "https://github.com/authrain-cloud-abdullahformuli/arnold#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/authrain-cloud-abdullahformuli/arnold.git"
+  },
+  "bugs": {
+    "url": "https://github.com/authrain-cloud-abdullahformuli/arnold/issues"
+  },
+  "keywords": [
+    "ai",
+    "planning",
+    "orchestration",
+    "deepseek",
+    "claude",
+    "codex",
+    "arnold",
+    "megaplan"
+  ],
+  "scripts": {
+    "test": "node test.mjs"
+  }
+}

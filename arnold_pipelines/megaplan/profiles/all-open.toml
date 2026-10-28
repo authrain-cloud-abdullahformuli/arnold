@@ -1,0 +1,15 @@
+# kimi-k2p6 (Fireworks): plan/prep/revise/gate/finalize/loop_plan - glm-5.1: critique/execute/review/loop_execute/tiebreakers
+[profiles.all-open]
+plan     = "omp:fireworks/kimi-k2.6"
+prep     = "omp:fireworks/kimi-k2.6"
+critique = "omp:zai/glm-5.1"
+revise   = "omp:fireworks/kimi-k2.6"
+gate     = "omp:fireworks/kimi-k2.6"
+finalize = "omp:fireworks/kimi-k2.6"
+execute  = "omp:zai/glm-5.1"
+feedback              = "omp:zai/glm-5.1"
+loop_plan    = "omp:fireworks/kimi-k2.6"
+loop_execute = "omp:zai/glm-5.1"
+review   = "omp:zai/glm-5.1"
+tiebreaker_researcher = "omp:zai/glm-5.1"
+tiebreaker_challenger = "omp:zai/glm-5.1"

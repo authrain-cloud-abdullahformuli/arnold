@@ -1,0 +1,217 @@
+#!/usr/bin/env bash
+set -euo pipefail
+SPEC="$1"
+ONE_FLAG="${2:-}"
+CANONICAL_LOG=".megaplan/cloud-chain.log"
+PROJECT_DIR="${MEGAPLAN_PROJECT_DIR:-$(pwd)}"
+EXPECTED_SESSION="${ARNOLD_CHAIN_SESSION:-${ARNOLD_SUPERVISE_SESSION:-chain}}"
+EXPECTED_PLAN_NAME="${ARNOLD_CHAIN_PLAN_NAME:-${MEGAPLAN_CHAIN_PLAN_NAME:-}}"
+
+# ── mandatory manifest-bound runtime (G2 finding 1; T-0011) ──────────
+# The engine dir is derived ONLY from the per-session runtime manifest
+# (epic.runtime_root); there is NO fixed-path shared-root fallback.
+# Pin the manifest BEFORE the mutable box-wide hot env is sourced
+# (.cloud-hot-env is credentials-only but may still advertise an older
+# runtime), then reassert it so a stale value can never replace the accepted
+# runtime identity — the same ordering as the launch prefix in cloud/cli.py.
+PINNED_RUNTIME_MANIFEST="${ARNOLD_RUNTIME_MANIFEST:-}"
+readonly PINNED_RUNTIME_MANIFEST
+if [[ -f /workspace/.cloud-hot-env ]]; then set -a; . /workspace/.cloud-hot-env; set +a; fi;
+if [[ -n "$PINNED_RUNTIME_MANIFEST" ]]; then export ARNOLD_RUNTIME_MANIFEST="$PINNED_RUNTIME_MANIFEST"; fi
+
+# Fail closed (T-0011): a readable per-session ARNOLD_RUNTIME_MANIFEST pin
+# with nonempty epic.runtime_root + epic.expected_head and a successful
+# runtime_provenance check is MANDATORY before any launch.
+if [[ -z "$PINNED_RUNTIME_MANIFEST" ]]; then
+  echo "[arnold-chain] isolated_chain_runtime_binding_drift: missing runtime manifest pin" >&2
+  exit 24
+fi
+if [[ ! -r "$PINNED_RUNTIME_MANIFEST" ]]; then
+  echo "[arnold-chain] isolated_chain_runtime_binding_drift: runtime manifest unreadable ($PINNED_RUNTIME_MANIFEST)" >&2
+  exit 24
+fi
+
+# ── canonical manifest reads (G6 round-2 finding 2; T-0301) ───────────
+# Stdlib JSON reads gated on the CANONICAL runtime-manifest schema: a field
+# is printed ONLY when the pinned file carries schema "1" plus the full
+# canonical top-level and epic required key sets — the SAME constants the
+# host CLI gate embeds (runtime_manifest.TOP_LEVEL_REQUIRED / EPIC_REQUIRED /
+# DEPENDENCY_GENERATION_KEYS / MANIFEST_SCHEMA_VERSION; the launcher-
+# conformance tests pin them).  A present-but-schema-invalid manifest yields
+# an EMPTY read, so the pin gate exits 24 instead of deriving a dirty
+# ENGINE_DIR or interpreter from it.  These reads are stdlib-only; they
+# never execute engine code.
+_read_manifest_field() {
+  # $1 = pinned manifest path; $2 = epic field name
+  env -u PYTHONHOME PYTHONSAFEPATH=1 python -P -c '
+import json, sys
+d = json.load(open(sys.argv[1]))
+R = ("runtime_id", "schema", "generation", "epic_id", "state", "owner", "base", "epic", "indirection", "policy", "promotions", "timestamps", "gc_policy", "commands")
+E = ("branch", "worktree_path", "venv_path", "runtime_root", "expected_head", "repair_bin", "deps_lockfile")
+e = d.get("epic") if isinstance(d, dict) and d.get("schema") == "1" and all(k in d for k in R) else None
+print(e.get(sys.argv[2], "")) if isinstance(e, dict) and all(k in e for k in E) else None
+' "$1" "$2" 2>/dev/null || true
+}
+
+# Generation-interpreter read (T-0301): the same canonical-schema gate PLUS
+# the dependency-generation proof completeness gate — epic.dependency_generation
+# must carry id / frozen_spec_sha256 / interpreter_path / venv_digest /
+# created.  An absent, partial, or schema-invalid proof yields an EMPTY read,
+# so the launch gate fails closed with exit 24 — a runtime without a
+# verifiable immutable dependency generation is never launched (G10).
+_read_generation_interpreter() {
+  # $1 = pinned manifest path
+  env -u PYTHONHOME PYTHONSAFEPATH=1 python -P -c '
+import json, sys
+d = json.load(open(sys.argv[1]))
+R = ("runtime_id", "schema", "generation", "epic_id", "state", "owner", "base", "epic", "indirection", "policy", "promotions", "timestamps", "gc_policy", "commands")
+E = ("branch", "worktree_path", "venv_path", "runtime_root", "expected_head", "repair_bin", "deps_lockfile")
+G = ("id", "frozen_spec_sha256", "interpreter_path", "venv_digest", "created")
+e = d.get("epic") if isinstance(d, dict) and d.get("schema") == "1" and all(k in d for k in R) else None
+g = e.get("dependency_generation") if isinstance(e, dict) and all(k in e for k in E) else None
+print(g.get("interpreter_path", "")) if isinstance(g, dict) and all(k in g for k in G) else None
+' "$1" 2>/dev/null || true
+}
+
+ENGINE_DIR="$(_read_manifest_field "$PINNED_RUNTIME_MANIFEST" "runtime_root")"
+if [[ -z "$ENGINE_DIR" ]]; then
+  echo "[arnold-chain] isolated_chain_runtime_binding_drift: manifest lacks epic.runtime_root" >&2
+  exit 24
+fi
+EXPECTED_REVISION="$(_read_manifest_field "$PINNED_RUNTIME_MANIFEST" "expected_head")"
+if [[ -z "$EXPECTED_REVISION" ]]; then
+  echo "[arnold-chain] isolated_chain_runtime_binding_drift: manifest lacks epic.expected_head" >&2
+  exit 24
+fi
+# T-0301: the generation-interpreter gate (proof completeness + executable
+# check) runs before the provenance check, and BOTH the provenance probe and
+# the launch execute under the generation interpreter — never the ambient
+# python and never an editable install.
+GEN_INTERPRETER="$(_read_generation_interpreter "$PINNED_RUNTIME_MANIFEST")"
+if [[ -z "$GEN_INTERPRETER" ]]; then
+  echo "[arnold-chain] isolated_chain_runtime_binding_drift: manifest lacks dependency generation interpreter" >&2
+  exit 24
+fi
+if [[ ! -x "$GEN_INTERPRETER" ]]; then
+  echo "[arnold-chain] isolated_chain_runtime_binding_drift: dependency generation interpreter not executable ($GEN_INTERPRETER)" >&2
+  exit 24
+fi
+# The provenance check runs under the generation interpreter with PYTHONPATH
+# set to exactly the manifest root (worktree-first: runtime code from the
+# pinned worktree, frozen dependencies from the immutable generation) so
+# active imports cannot resolve through an unbound shared checkout.
+if ! env -u PYTHONHOME PYTHONSAFEPATH=1 PYTHONPATH="$ENGINE_DIR" \
+    "$GEN_INTERPRETER" -P -m arnold_pipelines.megaplan.cloud.runtime_provenance \
+    --expected-root "$ENGINE_DIR" \
+    --expected-revision "$EXPECTED_REVISION" >/dev/null 2>&1; then
+  echo "[arnold-chain] isolated_chain_runtime_binding_drift: active imports disagree with manifest-bound runtime" >&2
+  exit 24
+fi
+
+# Reassert the shared Git/runtime/fixer boundary after the credentials-only
+# hot env has been loaded.  This is the same materializer used by the host
+# launcher, watchdog relaunch, and durable chain-drive command.
+ARNOLD_LAUNCH_BOUNDARY="/usr/local/bin/arnold-launch-boundary"
+if [[ ! -r "$ARNOLD_LAUNCH_BOUNDARY" ]]; then
+  ARNOLD_LAUNCH_BOUNDARY="$ENGINE_DIR/arnold_pipelines/megaplan/cloud/wrappers/arnold-launch-boundary"
+fi
+if [[ ! -r "$ARNOLD_LAUNCH_BOUNDARY" ]]; then
+  echo "[arnold-chain] launch_boundary_unavailable" >&2
+  exit 78
+fi
+. "$ARNOLD_LAUNCH_BOUNDARY"
+if arnold_materialize_launch_boundary "$EXPECTED_SESSION" "$ENGINE_DIR" "$ENGINE_DIR"; then :; else boundary_rc=$?; exit "$boundary_rc"; fi
+
+# ── pre-flight acceptance gate ───────────────────────────────────────
+# In atomic/enforce mode a completed chain with successors requiring
+# acceptance must carry a validated acceptance receipt for its final
+# milestone.  Restarting without one would re-initialise the successor
+# outside the Python chain flow.
+_check_acceptance_gate() {
+  local spec="$1" workspace="$2" gate_json gate_rc validation_rc validation_message
+  if gate_json="$(env -u PYTHONHOME PYTHONSAFEPATH=1 PYTHONPATH="$ENGINE_DIR" "$GEN_INTERPRETER" -P - "$spec" "$workspace" "chain_wrapper" "$EXPECTED_SESSION" "$EXPECTED_PLAN_NAME" <<'PY'
+import json, sys
+from arnold_pipelines.megaplan.cloud.wrapper_acceptance_gate import check_wrapper_acceptance_gate
+spec_path, workspace, caller = sys.argv[1:4]
+expected_session = sys.argv[4] if len(sys.argv) > 4 and sys.argv[4] else None
+expected_plan_name = sys.argv[5] if len(sys.argv) > 5 and sys.argv[5] else None
+result = check_wrapper_acceptance_gate(
+    spec_path,
+    workspace=workspace,
+    caller_kind=caller,
+    expected_session=expected_session,
+    expected_plan_name=expected_plan_name,
+)
+print(json.dumps(result, sort_keys=True))
+PY
+  )"; then
+    gate_rc=0
+  else
+    gate_rc=$?
+  fi
+
+  if [[ -z "$gate_json" ]]; then
+    if [[ "$gate_rc" == "0" ]]; then
+      echo "[arnold-chain] acceptance_gate_empty_output: canonical helper returned no decision" >&2
+    else
+      echo "[arnold-chain] acceptance_gate_helper_failed: canonical helper exited $gate_rc" >&2
+    fi
+    exit 65
+  fi
+
+  # Validate through the canonical helper module.  This is intentionally the
+  # only decision parser: the shell never defaults missing/malformed fields
+  # open and never interprets a raw gate_open value itself.
+  if validation_message="$(env -u PYTHONHOME PYTHONSAFEPATH=1 PYTHONPATH="$ENGINE_DIR" "$GEN_INTERPRETER" -P - "$gate_json" "$spec" "$workspace" "$EXPECTED_SESSION" "$EXPECTED_PLAN_NAME" <<'PY'
+import sys
+from arnold_pipelines.megaplan.cloud.wrapper_acceptance_gate import (
+    AcceptanceGateDecisionError,
+    validate_wrapper_acceptance_decision,
+)
+
+raw, spec_path, workspace, expected_session, expected_plan_name = sys.argv[1:]
+try:
+    validate_wrapper_acceptance_decision(
+        raw,
+        spec_path=spec_path,
+        workspace=workspace,
+        expected_session=expected_session or None,
+        expected_plan_name=expected_plan_name or None,
+    )
+except AcceptanceGateDecisionError as exc:
+    print(f"{exc.code}: {exc}", file=sys.stderr)
+    raise SystemExit(65)
+print("acceptance gate open")
+PY
+  )"; then
+    validation_rc=0
+  else
+    validation_rc=$?
+  fi
+  if [[ "$gate_rc" != "0" || "$validation_rc" != "0" ]]; then
+    if [[ "$gate_rc" != "0" && "$validation_rc" == "0" ]]; then
+      echo "[arnold-chain] acceptance_gate_helper_failed: canonical helper exited $gate_rc" >&2
+    else
+      echo "[arnold-chain] acceptance gate refused: ${validation_message:-canonical decision validation failed}" >&2
+    fi
+    exit 65
+  fi
+}
+
+_check_acceptance_gate "$SPEC" "$PROJECT_DIR"
+
+# G10 (no ambient-python launch): the ambient `python -P -m arnold_pipelines.megaplan chain start` launch form is REMOVED — the chain start below runs under the generation interpreter ($GEN_INTERPRETER, resolved + verified above) with worktree-first PYTHONPATH and frozen dependencies from the immutable generation.
+LAUNCH_REQUEST_B64="${ARNOLD_CHAIN_LAUNCH_REQUEST_B64:-}"
+if [[ -z "$LAUNCH_REQUEST_B64" ]]; then
+    echo "[arnold-chain] authoritative launch request missing; controller must invoke the co-located engine" >&2
+    exit 78
+fi
+
+# This wrapper is a validation/transport shim only.  The engine owns the
+# operation store, session creation, identity query, and acceptance commit.
+if ! arnold_materialize_launch_boundary "$EXPECTED_SESSION" "$ENGINE_DIR" "$ENGINE_DIR"; then
+    exit $?
+fi
+exec env -u PYTHONHOME PYTHONSAFEPATH=1 PYTHONPATH="$ENGINE_DIR" \
+    "$GEN_INTERPRETER" -P -m arnold_pipelines.megaplan.cloud.chain_drive \
+    --request-b64 "$LAUNCH_REQUEST_B64"

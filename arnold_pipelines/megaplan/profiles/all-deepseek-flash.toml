@@ -1,0 +1,15 @@
+# DeepSeek V4 Flash direct API for every megaplan phase.
+[profiles.all-deepseek-flash]
+plan     = "omp:deepseek/deepseek-v4-flash"
+prep     = "omp:deepseek/deepseek-v4-flash"
+critique = "omp:deepseek/deepseek-v4-flash"
+revise   = "omp:deepseek/deepseek-v4-flash"
+gate     = "omp:deepseek/deepseek-v4-flash"
+finalize = "omp:deepseek/deepseek-v4-flash"
+execute  = "omp:deepseek/deepseek-v4-flash"
+feedback              = "omp:deepseek/deepseek-v4-flash"
+loop_plan    = "omp:deepseek/deepseek-v4-flash"
+loop_execute = "omp:deepseek/deepseek-v4-flash"
+review   = "omp:deepseek/deepseek-v4-flash"
+tiebreaker_researcher = "omp:deepseek/deepseek-v4-flash"
+tiebreaker_challenger = "omp:deepseek/deepseek-v4-flash"

@@ -1,0 +1,40 @@
+# `partnered-5-grok` — partnered-5 with Grok (xAI) as the execution/reasoning
+# vendor. Per the operator's model split: cheap DeepSeek tiers stay on omp
+# for prep/gate/critique where applicable, but the codex:gpt-5.x slots (plan,
+# revise, finalize, review, execute tiers 5-10, tiebreakers) move to
+# omp:xai/grok-4.6. Requires XAI_API_KEY (console.x.ai) on the runtime.
+[profiles.partnered-5-grok]
+adaptive_critique = true
+plan                  = "omp:grok/grok-4.6"
+prep                  = "omp:deepseek/deepseek-v4-pro"
+critique              = "omp:deepseek/deepseek-v4-pro"
+critique_evaluator    = "omp:grok/grok-4.6"
+revise                = "omp:grok/grok-4.6"
+gate                  = "omp:deepseek/deepseek-v4-pro"
+finalize              = "omp:grok/grok-4.6"
+execute               = "omp:grok/grok-4.6"
+feedback              = "omp:grok/grok-4.6"
+loop_plan             = "omp:grok/grok-4.6"
+loop_execute          = "omp:grok/grok-4.6"
+review                = "omp:grok/grok-4.6"
+tiebreaker_researcher = "omp:grok/grok-4.6"
+tiebreaker_challenger = "omp:grok/grok-4.6"
+
+[profiles.partnered-5-grok.tier_models.execute]
+1 = "omp:deepseek/deepseek-v4-flash"
+2 = "omp:deepseek/deepseek-v4-flash"
+3 = "omp:deepseek/deepseek-v4-pro"
+4 = "omp:deepseek/deepseek-v4-pro"
+5 = "omp:grok/grok-4.6"
+6 = "omp:grok/grok-4.6"
+7 = "omp:grok/grok-4.6"
+8 = "omp:grok/grok-4.6"
+9 = "omp:grok/grok-4.6"
+10 = "omp:grok/grok-4.6"
+
+[profiles.partnered-5-grok.tier_models.critique]
+1 = "omp:deepseek/deepseek-v4-flash"
+2 = "omp:deepseek/deepseek-v4-pro"
+3 = "omp:deepseek/deepseek-v4-pro"
+4 = "omp:grok/grok-4.6"
+5 = "omp:grok/grok-4.6"

@@ -1,0 +1,769 @@
+"""Tests for centralized cloud repair feature flags.
+
+Covers:
+- Default-safe P3 behavior: resolver-observe ON, enforcement ON,
+  escalation-ledger OFF, autonomy OFF, redaction ON.
+- Explicit opt-out for redaction.
+- Explicit opt-in for ledger, autonomy (enforcement is default-on).
+- Flag independence (each flag gated by its own env var).
+- The single-flash babysitter is the only repair flow: the L1 repair-trigger
+  and L2 meta-repair flags were removed, and their retired path names always
+  fail closed.
+- Integration: flags are correctly wired into their consuming modules.
+"""
+
+from __future__ import annotations
+
+import os
+from pathlib import Path
+from unittest.mock import patch
+
+import pytest
+
+from arnold_pipelines.megaplan.cloud.feature_flags import (
+    audit_autofix_commit_enabled,
+    audit_autofix_commit_on,
+    audit_autofix_enabled,
+    audit_autofix_mutation_authorized,
+    audit_autofix_on,
+    autonomy_enabled,
+    autonomy_on,
+    escalation_ledger_enabled,
+    escalation_ledger_on,
+    MUTATION_PATH_L1,
+    MUTATION_PATH_L2,
+    MUTATION_PATH_L3,
+    mutation_authorized,
+    production_enforcement_enabled,
+    production_enforcement_on,
+    redaction_enabled,
+    redaction_on,
+    repair_request_queue_enabled,
+    repair_request_queue_on,
+    resolver_enforcement_enabled,
+    resolver_enforcement_on,
+    resolver_observe_enabled,
+    resolver_observe_on,
+)
+from arnold_pipelines.megaplan.cloud.human_blockers import EscalationLedgerWriter
+from arnold_pipelines.megaplan.cloud.current_target import resolve_current_target
+from arnold_pipelines.megaplan.cloud.redact import (
+    REDACTION,
+    redact_text as _redact_text,
+)
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _clear_env() -> dict:
+    return patch.dict(os.environ, {}, clear=True)
+
+
+def _set_env(**kwargs: str) -> dict:
+    return patch.dict(os.environ, kwargs, clear=True)
+
+
+# ---------------------------------------------------------------------------
+# M1 default-safety: every behaviour-changing flag is OFF
+# ---------------------------------------------------------------------------
+
+
+class TestM1Defaults:
+    """In M1 all behavior-changing paths are disabled by default."""
+
+    def test_resolver_observe_defaults_on(self) -> None:
+        with _clear_env():
+            assert resolver_observe_enabled() is True
+            assert resolver_observe_on() is True
+
+    def test_resolver_enforcement_defaults_on(self) -> None:
+        with _clear_env():
+            assert resolver_enforcement_enabled() is True
+            assert resolver_enforcement_on() is True
+
+    def test_escalation_ledger_defaults_off(self) -> None:
+        with _clear_env():
+            assert escalation_ledger_enabled() is False
+            assert escalation_ledger_on() is False
+
+    def test_autonomy_defaults_off(self) -> None:
+        with _clear_env():
+            assert autonomy_enabled() is False
+            assert autonomy_on() is False
+
+    def test_redaction_defaults_on(self) -> None:
+        with _clear_env():
+            assert redaction_enabled() is True
+            assert redaction_on() is True
+
+    def test_repair_request_queue_defaults_on(self) -> None:
+        with _clear_env():
+            assert repair_request_queue_enabled() is True
+            assert repair_request_queue_on() is True
+
+
+# ---------------------------------------------------------------------------
+# Explicit opt-out for redaction
+# ---------------------------------------------------------------------------
+
+
+class TestRedactionOptOut:
+    """Redaction is default-on but supports explicit opt-out via env var."""
+
+    def test_redaction_off_when_env_0(self) -> None:
+        with _set_env(ARNOLD_REDACTION_ENABLED="0"):
+            assert redaction_enabled() is False
+
+    def test_redaction_off_when_env_false(self) -> None:
+        with _set_env(ARNOLD_REDACTION_ENABLED="false"):
+            assert redaction_enabled() is False
+
+    def test_redaction_off_when_env_no(self) -> None:
+        with _set_env(ARNOLD_REDACTION_ENABLED="no"):
+            assert redaction_enabled() is False
+
+    def test_redaction_off_when_env_off(self) -> None:
+        with _set_env(ARNOLD_REDACTION_ENABLED="off"):
+            assert redaction_enabled() is False
+
+    def test_redaction_actually_skips_when_disabled(self) -> None:
+        text = "Authorization: Bearer secret-token-abc123"
+        with _set_env(ARNOLD_REDACTION_ENABLED="0"):
+            assert _redact_text(text) == text
+
+    def test_redaction_default_on_redacts(self) -> None:
+        text = "Authorization: Bearer secret-token-abc123"
+        with _clear_env():
+            result = _redact_text(text)
+            assert "secret-token-abc123" not in result
+            assert REDACTION in result
+
+
+# ---------------------------------------------------------------------------
+# Explicit opt-in for behavior-changing flags
+# ---------------------------------------------------------------------------
+
+
+class TestExplicitOptIn:
+    """Authority ledgers require opt-in; audit-autofix defaults on."""
+
+    @pytest.mark.parametrize(
+        "env_var,flag_func",
+        [
+            ("ARNOLD_ESCALATION_LEDGER", escalation_ledger_enabled),
+            ("ARNOLD_AUTONOMY", autonomy_enabled),
+        ],
+    )
+    def test_flag_off_by_default(self, env_var: str, flag_func) -> None:
+        with _clear_env():
+            assert flag_func() is False
+
+    def test_autonomy_off_by_default(self) -> None:
+        with _clear_env():
+            assert autonomy_enabled() is False
+
+    @pytest.mark.parametrize(
+        "env_var,flag_func",
+        [
+            ("ARNOLD_RESOLVER_ENFORCEMENT", resolver_enforcement_enabled),
+            ("ARNOLD_ESCALATION_LEDGER", escalation_ledger_enabled),
+            ("ARNOLD_AUTONOMY", autonomy_enabled),
+        ],
+    )
+    def test_flag_on_when_env_1(self, env_var: str, flag_func) -> None:
+        with _set_env(**{env_var: "1"}):
+            assert flag_func() is True
+
+    @pytest.mark.parametrize(
+        "env_var,flag_func",
+        [
+            ("ARNOLD_RESOLVER_ENFORCEMENT", resolver_enforcement_enabled),
+            ("ARNOLD_ESCALATION_LEDGER", escalation_ledger_enabled),
+            ("ARNOLD_AUTONOMY", autonomy_enabled),
+        ],
+    )
+    def test_flag_off_when_env_0(self, env_var: str, flag_func) -> None:
+        with _set_env(**{env_var: "0"}):
+            assert flag_func() is False
+
+    @pytest.mark.parametrize(
+        "env_var,flag_func",
+        [
+            ("ARNOLD_RESOLVER_ENFORCEMENT", resolver_enforcement_enabled),
+            ("ARNOLD_ESCALATION_LEDGER", escalation_ledger_enabled),
+            ("ARNOLD_AUTONOMY", autonomy_enabled),
+        ],
+    )
+    def test_flag_off_when_env_false(self, env_var: str, flag_func) -> None:
+        with _set_env(**{env_var: "false"}):
+            assert flag_func() is False
+
+    @pytest.mark.parametrize(
+        "env_var,flag_func",
+        [
+            ("ARNOLD_RESOLVER_ENFORCEMENT", resolver_enforcement_enabled),
+            ("ARNOLD_ESCALATION_LEDGER", escalation_ledger_enabled),
+            ("ARNOLD_AUTONOMY", autonomy_enabled),
+        ],
+    )
+    def test_flag_on_when_env_true(self, env_var: str, flag_func) -> None:
+        with _set_env(**{env_var: "true"}):
+            # "true" is recognized as truthy (not in the disable-values set)
+            assert flag_func() is True
+
+    @pytest.mark.parametrize(
+        "env_var,flag_func",
+        [
+            ("ARNOLD_RESOLVER_ENFORCEMENT", resolver_enforcement_enabled),
+            ("ARNOLD_ESCALATION_LEDGER", escalation_ledger_enabled),
+            ("ARNOLD_AUTONOMY", autonomy_enabled),
+        ],
+    )
+    def test_flag_off_when_env_empty(self, env_var: str, flag_func) -> None:
+        with _set_env(**{env_var: ""}):
+            # Empty string falls through to the flag's default.
+            expected = env_var == "ARNOLD_RESOLVER_ENFORCEMENT"
+            assert flag_func() is expected
+
+
+# ---------------------------------------------------------------------------
+# P3 custody production enforcement (default ON)
+# ---------------------------------------------------------------------------
+
+
+class TestProductionEnforcement:
+    """M7 custody production enforcement defaults ON with explicit opt-out."""
+
+    def test_production_enforcement_defaults_on(self) -> None:
+        with _clear_env():
+            assert production_enforcement_enabled() is True
+            assert production_enforcement_on() is True
+
+    def test_production_enforcement_off_when_env_0(self) -> None:
+        with _set_env(ARNOLD_M7_ACTION_VALIDATOR_ENFORCEMENT="0"):
+            assert production_enforcement_enabled() is False
+
+    def test_production_enforcement_off_when_env_false(self) -> None:
+        with _set_env(ARNOLD_M7_ACTION_VALIDATOR_ENFORCEMENT="false"):
+            assert production_enforcement_enabled() is False
+
+    def test_production_enforcement_on_when_env_1(self) -> None:
+        with _set_env(ARNOLD_M7_ACTION_VALIDATOR_ENFORCEMENT="1"):
+            assert production_enforcement_enabled() is True
+
+    def test_production_enforcement_on_when_env_unknown(self) -> None:
+        with _set_env(ARNOLD_M7_ACTION_VALIDATOR_ENFORCEMENT="maybe"):
+            assert production_enforcement_enabled() is True
+
+
+# ---------------------------------------------------------------------------
+# Resolver-observe explicit opt-out
+# ---------------------------------------------------------------------------
+
+
+class TestResolverObserveOptOut:
+    """Resolver observe defaults ON but supports explicit opt-out."""
+
+    def test_resolver_observe_off_when_env_0(self) -> None:
+        with _set_env(ARNOLD_RESOLVER_OBSERVE="0"):
+            assert resolver_observe_enabled() is False
+
+    def test_resolver_observe_off_when_env_false(self) -> None:
+        with _set_env(ARNOLD_RESOLVER_OBSERVE="false"):
+            assert resolver_observe_enabled() is False
+
+    def test_resolver_observe_still_on_when_env_1(self) -> None:
+        with _set_env(ARNOLD_RESOLVER_OBSERVE="1"):
+            assert resolver_observe_enabled() is True
+
+    def test_resolver_observe_on_by_default(self) -> None:
+        with _clear_env():
+            assert resolver_observe_enabled() is True
+
+
+class TestRepairRequestQueueOptOut:
+    """Repair queue marker production defaults ON but can be disabled."""
+
+    def test_repair_request_queue_off_when_env_0(self) -> None:
+        with _set_env(ARNOLD_REPAIR_REQUEST_QUEUE="0"):
+            assert repair_request_queue_enabled() is False
+
+    def test_repair_request_queue_on_when_env_true(self) -> None:
+        with _set_env(ARNOLD_REPAIR_REQUEST_QUEUE="true"):
+            assert repair_request_queue_enabled() is True
+
+
+# ---------------------------------------------------------------------------
+# Flag independence
+# ---------------------------------------------------------------------------
+
+
+class TestFlagIndependence:
+    """Each flag is gated by its own env var — no cross-flag inheritance."""
+
+    def test_resolver_enforcement_independent_of_observe(self) -> None:
+        with _set_env(ARNOLD_RESOLVER_OBSERVE="1"):
+            # Observe does not turn enforcement off; enforcement defaults ON.
+            assert resolver_enforcement_enabled() is True
+
+    def test_escalation_ledger_independent_of_autonomy(self) -> None:
+        with _set_env(ARNOLD_AUTONOMY="1"):
+            assert escalation_ledger_enabled() is False
+
+    def test_autonomy_independent_of_enforcement(self) -> None:
+        with _set_env(ARNOLD_RESOLVER_ENFORCEMENT="1"):
+            assert autonomy_enabled() is False
+
+    def test_redaction_independent_of_other_flags(self) -> None:
+        with _set_env(
+            ARNOLD_RESOLVER_ENFORCEMENT="1",
+            ARNOLD_ESCALATION_LEDGER="1",
+            ARNOLD_AUTONOMY="1",
+        ):
+            # Redaction defaults to ON even when all other flags are explicitly ON
+            assert redaction_enabled() is True
+
+
+# ---------------------------------------------------------------------------
+# Master-plus-path mutation authorization
+# ---------------------------------------------------------------------------
+
+
+_MUTATION_PATHS = (
+    (MUTATION_PATH_L3, "ARNOLD_AUDIT_AUTOFIX_ENABLED"),
+)
+_MUTATION_CLASSES = ("state", "source", "commit", "push", "subprocess")
+
+
+class TestMutationAuthorization:
+    """Every mutation class needs the master gate and its relevant path gate."""
+
+    @pytest.mark.parametrize("path,path_env", _MUTATION_PATHS)
+    @pytest.mark.parametrize("mutation_class", _MUTATION_CLASSES)
+    @pytest.mark.parametrize(
+        ("master_enabled", "path_enabled"),
+        ((False, False), (False, True), (True, False), (True, True)),
+    )
+    def test_master_and_path_matrix(
+        self,
+        path: str,
+        path_env: str,
+        mutation_class: str,
+        master_enabled: bool,
+        path_enabled: bool,
+    ) -> None:
+        """L3 effects authorize only for the true/true row."""
+        with _set_env(
+            ARNOLD_AUTONOMY="1" if master_enabled else "0",
+            **{path_env: "1" if path_enabled else "0"},
+        ):
+            assert mutation_authorized(path) is (master_enabled and path_enabled), (
+                f"{path} {mutation_class} mutation must require master and path gates"
+            )
+            # Observation is intentionally not part of mutation authorization.
+            assert resolver_observe_enabled() is True
+            assert repair_request_queue_enabled() is True
+
+    def test_retired_l1_l2_paths_fail_closed(self) -> None:
+        """The layered L1/L2 repair stack was removed: even with the master
+        gate and the surviving L3 gate open, the retired path names never
+        authorize mutation."""
+        with _set_env(
+            ARNOLD_AUTONOMY="1",
+            ARNOLD_AUDIT_AUTOFIX_ENABLED="1",
+        ):
+            assert mutation_authorized(MUTATION_PATH_L1) is False
+            assert mutation_authorized(MUTATION_PATH_L2) is False
+            assert mutation_authorized(MUTATION_PATH_L3) is True
+
+    def test_unknown_mutation_path_fails_closed(self) -> None:
+        with _set_env(ARNOLD_AUTONOMY="1"):
+            assert mutation_authorized("unknown") is False
+
+
+# ---------------------------------------------------------------------------
+# Integration: EscalationLedgerWriter respects the centralized flag
+# ---------------------------------------------------------------------------
+
+
+class TestLedgerWriterIntegration:
+    """EscalationLedgerWriter respects ARNOLD_ESCALATION_LEDGER flag."""
+
+    def test_ledger_writer_disabled_by_default(self) -> None:
+        with _clear_env():
+            writer = EscalationLedgerWriter()
+            assert writer.enabled is False
+
+    def test_ledger_writer_enabled_when_flag_on(self) -> None:
+        with _set_env(ARNOLD_ESCALATION_LEDGER="1"):
+            writer = EscalationLedgerWriter()
+            assert writer.enabled is True
+
+    def test_ledger_writer_still_disabled_when_flag_off(self) -> None:
+        with _set_env(ARNOLD_ESCALATION_LEDGER="0"):
+            writer = EscalationLedgerWriter()
+            assert writer.enabled is False
+
+    def test_ledger_writer_explicit_override(self) -> None:
+        """Explicit _enabled kwarg overrides the env-var default."""
+        with _set_env(ARNOLD_ESCALATION_LEDGER="1"):
+            writer = EscalationLedgerWriter(_enabled=False)
+            assert writer.enabled is False
+
+    def test_ledger_writer_explicit_enable_still_works(self, tmp_path: Path) -> None:
+        """Explicit enable() works regardless of default state."""
+        with _clear_env():
+            writer = EscalationLedgerWriter()
+            assert writer.enabled is False
+            writer.enable(tmp_path / "sidecars")
+            assert writer.enabled is True
+
+
+# ---------------------------------------------------------------------------
+# Integration: resolve_current_target returns stub when observe is disabled
+# ---------------------------------------------------------------------------
+
+
+class TestResolverObserveIntegration:
+    """resolve_current_target returns a minimal stub when observe is disabled."""
+
+    def test_resolve_returns_stub_when_observe_disabled(self) -> None:
+        with _set_env(ARNOLD_RESOLVER_OBSERVE="0"):
+            result = resolve_current_target(
+                "test-session",
+                marker_dir="/nonexistent/markers",
+            )
+            assert result["schema_version"] == 2
+            assert result["session"] == "test-session"
+            assert result["authoritative_source"] == "resolver_observe_disabled"
+            assert "resolver observe disabled" in result["rationale"][0]
+            # Stub contains empty structures, not filesystem-derived data
+            assert result["current_refs"] == {}
+            assert result["stale_evidence"] == []
+            assert result["sibling_sessions"] == []
+
+    def test_resolve_runs_normally_when_observe_enabled(
+        self, tmp_path: Path
+    ) -> None:
+        """When observe is enabled (default), the resolver inspects filesystem."""
+        marker_dir = tmp_path / "markers"
+        marker_dir.mkdir()
+        marker_path = marker_dir / "test-session.json"
+        marker_path.write_text('{"session":"test-session","workspace":"/tmp/ws","run_kind":"plan"}')
+
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+
+        with _set_env(ARNOLD_RESOLVER_OBSERVE="1"):
+            result = resolve_current_target(
+                "test-session",
+                marker_dir=str(marker_dir),
+            )
+            # Should not return the observe-disabled stub
+            assert result["authoritative_source"] != "resolver_observe_disabled"
+            # Should contain filesystem-derived data
+            assert result["marker"]["present"] is True
+
+
+# ---------------------------------------------------------------------------
+# M5 meta-repair and auditor feature flags (default ON)
+# ---------------------------------------------------------------------------
+
+
+class TestM5Defaults:
+    """The surviving L3 auditor-autofix flags are on by default."""
+
+    def test_audit_autofix_defaults_on(self) -> None:
+        with _clear_env():
+            assert audit_autofix_enabled() is True
+            assert audit_autofix_on() is True
+
+    def test_audit_autofix_commit_defaults_on(self) -> None:
+        with _clear_env():
+            assert audit_autofix_commit_enabled() is True
+            assert audit_autofix_commit_on() is True
+
+
+class TestM5ExplicitOptIn:
+    """Surviving L3 audit-autofix flags default ON and support explicit
+    disabling.  The L1 repair-trigger and L2 meta-repair flags were removed
+    with the layered repair stack."""
+
+    @pytest.mark.parametrize(
+        "env_var,flag_func",
+        [
+            ("ARNOLD_AUDIT_AUTOFIX_ENABLED", audit_autofix_enabled),
+            ("ARNOLD_AUDIT_AUTOFIX_COMMIT_ENABLED", audit_autofix_commit_enabled),
+        ],
+    )
+    def test_flag_on_by_default(self, env_var: str, flag_func) -> None:
+        with _clear_env():
+            assert flag_func() is True
+
+    @pytest.mark.parametrize(
+        "env_var,flag_func",
+        [
+            ("ARNOLD_AUDIT_AUTOFIX_ENABLED", audit_autofix_enabled),
+            ("ARNOLD_AUDIT_AUTOFIX_COMMIT_ENABLED", audit_autofix_commit_enabled),
+        ],
+    )
+    def test_flag_on_when_env_1(self, env_var: str, flag_func) -> None:
+        with _set_env(**{env_var: "1"}):
+            assert flag_func() is True
+
+    @pytest.mark.parametrize(
+        "env_var,flag_func",
+        [
+            ("ARNOLD_AUDIT_AUTOFIX_ENABLED", audit_autofix_enabled),
+            ("ARNOLD_AUDIT_AUTOFIX_COMMIT_ENABLED", audit_autofix_commit_enabled),
+        ],
+    )
+    def test_flag_off_when_env_0(self, env_var: str, flag_func) -> None:
+        with _set_env(**{env_var: "0"}):
+            assert flag_func() is False
+
+    @pytest.mark.parametrize(
+        "env_var,flag_func",
+        [
+            ("ARNOLD_AUDIT_AUTOFIX_ENABLED", audit_autofix_enabled),
+            ("ARNOLD_AUDIT_AUTOFIX_COMMIT_ENABLED", audit_autofix_commit_enabled),
+        ],
+    )
+    def test_flag_off_when_env_false(self, env_var: str, flag_func) -> None:
+        with _set_env(**{env_var: "false"}):
+            assert flag_func() is False
+
+    @pytest.mark.parametrize(
+        "env_var,flag_func",
+        [
+            ("ARNOLD_AUDIT_AUTOFIX_ENABLED", audit_autofix_enabled),
+            ("ARNOLD_AUDIT_AUTOFIX_COMMIT_ENABLED", audit_autofix_commit_enabled),
+        ],
+    )
+    def test_flag_on_when_env_true(self, env_var: str, flag_func) -> None:
+        with _set_env(**{env_var: "true"}):
+            # "true" is recognized as truthy (not in the disable-values set)
+            assert flag_func() is True
+
+    @pytest.mark.parametrize(
+        "env_var,flag_func",
+        [
+            ("ARNOLD_AUDIT_AUTOFIX_ENABLED", audit_autofix_enabled),
+            ("ARNOLD_AUDIT_AUTOFIX_COMMIT_ENABLED", audit_autofix_commit_enabled),
+        ],
+    )
+    def test_flag_off_when_env_empty(self, env_var: str, flag_func) -> None:
+        with _set_env(**{env_var: ""}):
+            # Empty string falls through to default ON for these flags.
+            assert flag_func() is True
+
+
+class TestM5FlagIndependence:
+    """Each surviving L3 flag is gated by its own env var — no cross-flag
+    leakage."""
+
+    def test_audit_autofix_independent_of_commits(self) -> None:
+        with _set_env(ARNOLD_AUDIT_AUTOFIX_COMMIT_ENABLED="1"):
+            assert audit_autofix_enabled() is True
+
+    def test_audit_autofix_flags_independent_of_autonomy(self) -> None:
+        with _set_env(ARNOLD_AUTONOMY="1"):
+            assert audit_autofix_enabled() is True
+            assert audit_autofix_commit_enabled() is True
+
+
+# ---------------------------------------------------------------------------
+# T-0013 regression locks: SHADOW_PASS / explicit-disable never authorize WBC
+# ---------------------------------------------------------------------------
+
+
+class TestT0013WbcShadowLock:
+    """SHADOW_PASS, explicit-disable values, and missing attestation NEVER
+    authorize a WBC effect — enforcement-off means shadow mode, never
+    authority (deny-by-default)."""
+
+    def test_shadow_pass_never_authorizes_wbc_boundary_effect(self) -> None:
+        """A SHADOW_PASS gate result is NEVER authoritative: with custody
+        enforcement disabled the boundary result is ``shadow_pass`` and
+        ``authorized`` stays False; with enforcement enabled the same
+        boundary is blocked.  WBC effects must test ``authorized`` — never
+        treat ``shadow_pass`` as a pass (worker_dispatch_wbc consumes
+        :func:`production_enforcement_enabled` for this exact gate)."""
+        from arnold_pipelines.megaplan.custody.action_validator import (
+            ActionBoundaryContext,
+            GateResult,
+            adapter_effect_authorized,
+            validate_action_boundary,
+        )
+        from arnold_pipelines.megaplan.custody.contracts import CustodyTargetKey
+
+        target = CustodyTargetKey(
+            environment="prod",
+            session="s1",
+            chain="c1",
+            plan_revision="p1",
+            phase="execute",
+            task="T1",
+            attempt="1",
+            normalized_failure_kind="blocked_no_lease",
+            blocker_or_phase_result_hash="hash",
+            fence="fence",
+        )
+        context = ActionBoundaryContext(
+            action_type="repair",
+            target=target,
+            run_authority_grant_id="grant-1",
+            coordinator_fence_token=1,
+        )
+        with _clear_env():
+            shadow = validate_action_boundary(context, enforcement_enabled=False)
+        assert shadow.gate_result == GateResult.SHADOW_PASS
+        # SHADOW_PASS is never an authorization — it is shadow telemetry.
+        assert shadow.authorized is False
+        assert shadow.blocked is False  # shadow mode is observe-only
+        # And the denial must stop the effect: the shared raw-adapter
+        # predicate that admits mutations fails closed on SHADOW_PASS, so no
+        # adapter can reserve or dispatch under this verdict.
+        assert adapter_effect_authorized(shadow.gate_result) is False
+        with _clear_env():
+            enforced = validate_action_boundary(context, enforcement_enabled=True)
+        assert enforced.authorized is False
+        assert enforced.blocked is True
+        assert enforced.gate_result != GateResult.AUTHORIZED
+        # Enforcement mode verdicts are likewise inadmissible at the effect
+        # boundary — only an explicit AUTHORIZED verdict ever dispatches.
+        assert adapter_effect_authorized(enforced.gate_result) is False
+
+    @pytest.mark.parametrize("value", ("0", "false", "no", "off", "FALSE", "Off"))
+    def test_shadow_mode_explicit_disable_values_never_authorize(self, value: str) -> None:
+        """Every explicit-disable spelling (0/false/no/off, case-insensitive)
+        turns OFF the WBC custody enforcement gate — the validator runs in
+        shadow mode (``shadow_pass``), which never authorizes an effect."""
+        with _set_env(ARNOLD_M7_ACTION_VALIDATOR_ENFORCEMENT=value):
+            assert production_enforcement_enabled() is False
+            assert production_enforcement_on() is False
+
+    def test_shadow_mode_unknown_or_empty_enforcement_values_stay_deny_by_default(self) -> None:
+        """Unknown/empty values keep enforcement ON (deny-by-default): only
+        the explicit disable set turns the gate off, and even then the
+        feature-flag consumer reports shadow mode, never authorization."""
+        for value in ("", "maybe", "1", "true", "yes", "on"):
+            with _set_env(ARNOLD_M7_ACTION_VALIDATOR_ENFORCEMENT=value):
+                assert production_enforcement_enabled() is True
+
+    def test_wbc_dispatch_shadow_gate_consumes_production_enforcement(self) -> None:
+        """The WBC dispatch facade's enforcement flag is the feature-flag
+        accessor itself — no separate shadow default lives in the consumer
+        (worker_dispatch_wbc imports it directly)."""
+        import inspect
+
+        from arnold_pipelines.megaplan.custody import worker_dispatch_wbc
+
+        source = inspect.getsource(worker_dispatch_wbc)
+        assert "production_enforcement_enabled" in source
+        assert (
+            "enforcement_enabled=production_enforcement_enabled()" in source
+        )
+
+
+# ---------------------------------------------------------------------------
+# T-0014 shared raw-adapter effect authorization contract
+# ---------------------------------------------------------------------------
+
+
+class TestT0014AdapterEffectAuthorization:
+    """Raw mutation adapters require one explicit authoritative verdict."""
+
+    def test_only_authorized_verdict_allows_an_effect(self) -> None:
+        from arnold_pipelines.megaplan.custody.action_validator import (
+            GateResult,
+            adapter_effect_authorized,
+        )
+
+        assert adapter_effect_authorized(GateResult.AUTHORIZED) is True
+        assert adapter_effect_authorized(GateResult.SHADOW_PASS) is False
+        assert adapter_effect_authorized(None) is False
+
+
+# ---------------------------------------------------------------------------
+# T-0208 ghost controls: report filters are never authority; the audit
+# commit flag is a live effect-boundary gate
+# ---------------------------------------------------------------------------
+
+
+class TestT0208ReportFiltersNeverAuthorize:
+    """MEGAPLAN_AUDIT_SESSION_ALLOWLIST / MEGAPLAN_AUDIT_PLAN_ALLOWLIST are
+    REPORT-ONLY row filters.  Setting them must never authorize (or block)
+    mutation, dispatch, commit, or push — the authorization surface is
+    autonomy + path gates only."""
+
+    def test_allowlists_never_authorize_mutation_without_autonomy(self) -> None:
+        with _set_env(
+            MEGAPLAN_AUDIT_SESSION_ALLOWLIST="any-session",
+            MEGAPLAN_AUDIT_PLAN_ALLOWLIST="any-plan",
+        ):
+            for path in (MUTATION_PATH_L1, MUTATION_PATH_L2, MUTATION_PATH_L3):
+                assert mutation_authorized(path) is False
+
+    def test_allowlists_never_authorize_when_path_gate_closed(self) -> None:
+        with _set_env(
+            ARNOLD_AUTONOMY="1",
+            ARNOLD_AUDIT_AUTOFIX_ENABLED="0",
+            MEGAPLAN_AUDIT_SESSION_ALLOWLIST="any-session",
+            MEGAPLAN_AUDIT_PLAN_ALLOWLIST="any-plan",
+        ):
+            assert mutation_authorized(MUTATION_PATH_L3) is False
+
+    def test_allowlists_are_not_consulted_by_the_mutation_gate(self) -> None:
+        # Even when autonomy + path are granted, the allowlists neither add
+        # nor remove authority: they are report filters, so the mutation gate
+        # result is identical with or without them.
+        with _set_env(
+            ARNOLD_AUTONOMY="1",
+            ARNOLD_AUDIT_AUTOFIX_ENABLED="1",
+            MEGAPLAN_AUDIT_SESSION_ALLOWLIST="any-session",
+            MEGAPLAN_AUDIT_PLAN_ALLOWLIST="any-plan",
+        ):
+            with_allowlists = mutation_authorized(MUTATION_PATH_L3)
+        with _set_env(ARNOLD_AUTONOMY="1", ARNOLD_AUDIT_AUTOFIX_ENABLED="1"):
+            without_allowlists = mutation_authorized(MUTATION_PATH_L3)
+        assert with_allowlists is True
+        assert with_allowlists == without_allowlists
+
+    def test_mutation_remains_default_off(self) -> None:
+        # Report filters cannot flip the default-off mutation posture.
+        with _set_env(
+            MEGAPLAN_AUDIT_SESSION_ALLOWLIST="any-session",
+            MEGAPLAN_AUDIT_PLAN_ALLOWLIST="any-plan",
+        ):
+            assert autonomy_enabled() is False
+            assert mutation_authorized(MUTATION_PATH_L3) is False
+
+
+class TestT0208AuditCommitFlagIsEffectBoundaryGate:
+    """ARNOLD_AUDIT_AUTOFIX_COMMIT_ENABLED is a live control enforced at the
+    auditor's commit-capable effect boundary (T-0208).  It gates commit-
+    capable dispatch, NOT the read-only L3 reviewer dispatch, which stays on
+    the master-plus-path mutation gate alone."""
+
+    def test_commit_flag_off_blocks_commit_authority_but_not_reviewer_gate(self) -> None:
+        # autonomy + L3 path granted, commit gate closed: the read-only
+        # reviewer dispatch is still authorized (it cannot commit), while the
+        # commit-capable effect authority is denied.
+        with _set_env(
+            ARNOLD_AUTONOMY="1",
+            ARNOLD_AUDIT_AUTOFIX_ENABLED="1",
+            ARNOLD_AUDIT_AUTOFIX_COMMIT_ENABLED="0",
+        ):
+            assert audit_autofix_mutation_authorized() is True
+            assert audit_autofix_commit_enabled() is False
+            assert audit_autofix_commit_on() is False
+
+    def test_commit_flag_never_adds_authority_by_itself(self) -> None:
+        # The commit flag is a gate, never an authority source: without
+        # autonomy the L3 mutation gate stays closed no matter the commit flag.
+        with _set_env(ARNOLD_AUDIT_AUTOFIX_COMMIT_ENABLED="1"):
+            assert audit_autofix_mutation_authorized() is False

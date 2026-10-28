@@ -1,0 +1,305 @@
+"""Tests for the ``arnold`` console entry (omp named-agent runner)."""
+
+from __future__ import annotations
+
+import os
+
+from pathlib import Path
+
+import pytest
+
+
+
+from agentbox import arnold_agent
+
+
+def test_missing_launcher_is_a_clean_error(monkeypatch, capsys) -> None:
+    monkeypatch.delenv("ARNOLD_AGENT_LAUNCHER", raising=False)
+    monkeypatch.setattr(arnold_agent, "_LAUNCHER_CANDIDATES", (Path("/nonexistent/agent"),))
+    monkeypatch.setattr(arnold_agent.shutil, "which", lambda _: None)
+
+    assert arnold_agent.main(["hello"]) == 1
+
+    err = capsys.readouterr().err
+    assert "could not locate the omp agent launcher" in err
+
+
+def test_launcher_resolution_prefers_bun_and_skips_grok(monkeypatch, tmp_path) -> None:
+    bun = tmp_path / "bun" / "agent"
+    bun.parent.mkdir(parents=True, exist_ok=True)
+    bun.write_text("#!/bin/sh\n", encoding="utf-8")
+    monkeypatch.setattr(arnold_agent, "_LAUNCHER_CANDIDATES", (bun,))
+    monkeypatch.setattr(
+        arnold_agent.shutil, "which", lambda _: str(tmp_path / ".grok" / "bin" / "agent")
+    )
+
+    resolved = arnold_agent._find_launcher()
+
+    assert resolved == bun
+
+
+def test_env_override_selects_launcher(monkeypatch, tmp_path) -> None:
+    override = tmp_path / "custom-agent"
+    override.write_text("#!/bin/sh\n", encoding="utf-8")
+    monkeypatch.setenv("ARNOLD_AGENT_LAUNCHER", str(override))
+
+    assert arnold_agent._find_launcher() == override
+
+
+def test_main_execs_run_with_default_agent(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_execvp(file: str, argv: list[str]) -> None:
+        captured["file"] = file
+        captured["argv"] = argv
+
+    monkeypatch.setattr(arnold_agent.os, "execvp", fake_execvp)
+    monkeypatch.setattr(
+        arnold_agent,
+        "_find_launcher",
+        lambda: Path("/Users/fake/.bun/bin/agent"),
+    )
+
+    arnold_agent.main(["What is running?"])
+
+    assert captured["file"] == "/Users/fake/.bun/bin/agent"
+    assert captured["argv"] == [
+        "/Users/fake/.bun/bin/agent",
+        "run",
+        "arnold",
+        "--print",
+        "What is running?",
+    ]
+
+
+def test_main_supports_agent_switch_and_flag_forwarding(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_execvp(_file: str, argv: list[str]) -> None:
+        captured["argv"] = argv
+
+    monkeypatch.setattr(arnold_agent.os, "execvp", fake_execvp)
+    monkeypatch.setattr(arnold_agent, "_find_launcher", lambda: Path("/l/agent"))
+
+    arnold_agent.main(["--agent", "scout", "--resume", "message"])
+
+    assert captured["argv"] == ["/l/agent", "run", "scout", "--resume", "message"]
+
+
+def test_main_rejects_dangling_agent_flag(monkeypatch, capsys) -> None:
+    monkeypatch.setattr(arnold_agent.os, "execvp", lambda *_: None)
+    monkeypatch.setattr(arnold_agent, "_find_launcher", lambda: Path("/l/agent"))
+
+    assert arnold_agent.main(["--agent"]) == 1
+
+    err = capsys.readouterr().err
+    assert '--agent requires a value (e.g. arnold --agent scout "hi")' in err
+
+
+def test_leading_flags_pass_through_and_message_implies_print(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_execvp(_file: str, argv: list[str]) -> None:
+        captured["argv"] = argv
+
+    monkeypatch.setattr(arnold_agent.os, "execvp", fake_execvp)
+    monkeypatch.setattr(arnold_agent, "_find_launcher", lambda: Path("/l/agent"))
+
+    arnold_agent.main(["-c", "follow-up question"])
+
+    assert captured["argv"] == ["/l/agent", "run", "arnold", "-c", "--print", "follow-up question"]
+
+
+def test_value_flag_consumes_its_argument(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_execvp(_file: str, argv: list[str]) -> None:
+        captured["argv"] = argv
+
+    monkeypatch.setattr(arnold_agent.os, "execvp", fake_execvp)
+    monkeypatch.setattr(arnold_agent, "_find_launcher", lambda: Path("/l/agent"))
+
+    arnold_agent.main(["--resume", "abc123"])
+
+    assert captured["argv"] == ["/l/agent", "run", "arnold", "--resume", "abc123"]
+
+
+def test_help_flag_prints_usage_without_exec(monkeypatch, capsys) -> None:
+    def fail_execvp(*_args: object) -> None:
+        raise AssertionError("execvp must not run for --help")
+
+    monkeypatch.setattr(arnold_agent.os, "execvp", fail_execvp)
+
+    assert arnold_agent.main(["-h"]) == 0
+    assert arnold_agent.main(["--agent", "scout", "--help"]) == 0
+
+    out = capsys.readouterr().out
+    assert "usage: arnold [flags] [message...]" in out
+    assert "--agent NAME" in out
+
+
+def test_flags_after_message_are_rejected(monkeypatch, capsys) -> None:
+    def fail_execvp(*_args: object) -> None:
+        raise AssertionError("execvp must not run for misplaced flags")
+
+    monkeypatch.setattr(arnold_agent.os, "execvp", fail_execvp)
+    monkeypatch.setattr(arnold_agent, "_find_launcher", lambda: Path("/l/agent"))
+
+    assert arnold_agent.main(["follow-up", "-c"]) == 1
+
+    assert "flags must precede the message" in capsys.readouterr().err
+
+
+class _FakeStderr:
+    """Minimal write-only stream with a controllable isatty."""
+
+    def __init__(self, isatty: bool) -> None:
+        self._isatty = isatty
+        self.parts: list[str] = []
+
+    def isatty(self) -> bool:
+        return self._isatty
+
+    def write(self, text: str) -> int:
+        self.parts.append(text)
+        return len(text)
+
+    def flush(self) -> None:
+        pass
+
+
+def test_identity_label_default_and_custom_agents() -> None:
+    assert arnold_agent._identity_label("arnold") == "AgentBox Operator"
+    assert arnold_agent._identity_label("scout") == "agent · scout"
+
+
+def test_one_shot_header_brands_stderr_and_tab_title_on_a_tty() -> None:
+    stream = _FakeStderr(isatty=True)
+    arnold_agent._print_one_shot_header("arnold", stream=stream)
+    rendered = "".join(stream.parts)
+    assert "\x1b]0;arnold · AgentBox Operator\x07" in rendered
+    assert "\x1b[1marnold · AgentBox Operator\x1b[0m" in rendered
+
+
+def test_one_shot_header_uses_custom_agent_label() -> None:
+    stream = _FakeStderr(isatty=True)
+    arnold_agent._print_one_shot_header("scout", stream=stream)
+    assert "agent · scout" in "".join(stream.parts)
+
+
+def test_one_shot_header_skipped_when_not_a_tty() -> None:
+    stream = _FakeStderr(isatty=False)
+    arnold_agent._print_one_shot_header("arnold", stream=stream)
+    assert stream.parts == []
+
+def test_select_omp_bin_prefers_branded_build(monkeypatch, tmp_path) -> None:
+    branded = tmp_path / "omp"
+    branded.write_text("#!/bin/sh\n", encoding="utf-8")
+    monkeypatch.setattr(arnold_agent, "_BRANDED_OMP", branded)
+    monkeypatch.delenv("OMP_BIN", raising=False)
+    monkeypatch.delenv("ARNOLD_STOCK_OMP", raising=False)
+
+    arnold_agent._select_omp_bin()
+
+    assert os.environ["OMP_BIN"] == str(branded)
+
+
+def test_select_omp_bin_keeps_existing_override(monkeypatch, tmp_path) -> None:
+    branded = tmp_path / "omp"
+    branded.write_text("#!/bin/sh\n", encoding="utf-8")
+    monkeypatch.setattr(arnold_agent, "_BRANDED_OMP", branded)
+    monkeypatch.setenv("OMP_BIN", "/custom/omp")
+    monkeypatch.delenv("ARNOLD_STOCK_OMP", raising=False)
+
+    arnold_agent._select_omp_bin()
+
+    assert os.environ["OMP_BIN"] == "/custom/omp"
+
+
+def test_select_omp_bin_stock_opt_out(monkeypatch, tmp_path) -> None:
+    branded = tmp_path / "omp"
+    branded.write_text("#!/bin/sh\n", encoding="utf-8")
+    monkeypatch.setattr(arnold_agent, "_BRANDED_OMP", branded)
+    monkeypatch.delenv("OMP_BIN", raising=False)
+    monkeypatch.setenv("ARNOLD_STOCK_OMP", "1")
+
+    arnold_agent._select_omp_bin()
+
+    assert "OMP_BIN" not in os.environ
+
+
+def _script_bin(
+    path, exit_code: int = 0, output: str = arnold_agent._ONBOARD_HELP_MARKER
+):
+    """Executable stub that prints *output* then exits with *exit_code*."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "#!/bin/sh\n"
+        f"printf '%s\\n' '{output}'\n"
+        f"exit {exit_code}\n",
+        encoding="utf-8",
+    )
+    path.chmod(0o755)
+    return path
+
+
+def test_resolve_omp_bin_override_wins_over_branded(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(arnold_agent, "_BRANDED_OMP", _script_bin(tmp_path / "branded-omp"))
+    env = {"OMP_BIN": "/custom/omp"}
+
+    assert arnold_agent._resolve_omp_bin(env) == "/custom/omp"
+
+
+def test_resolve_omp_bin_prefers_branded_over_path(monkeypatch, tmp_path) -> None:
+    branded = _script_bin(tmp_path / "branded-omp")
+    monkeypatch.setattr(arnold_agent, "_BRANDED_OMP", branded)
+    monkeypatch.setattr(arnold_agent.shutil, "which", lambda name: "/path/omp")
+
+    assert arnold_agent._resolve_omp_bin({}) == str(branded)
+
+
+def test_resolve_omp_bin_stock_opt_out_skips_branded(
+    monkeypatch, tmp_path
+) -> None:
+    branded = _script_bin(tmp_path / "branded-omp")
+    monkeypatch.setattr(arnold_agent, "_BRANDED_OMP", branded)
+    monkeypatch.setattr(arnold_agent.shutil, "which", lambda name: "/path/omp")
+
+    assert arnold_agent._resolve_omp_bin({"ARNOLD_STOCK_OMP": "1"}) == "/path/omp"
+
+
+def test_resolve_omp_bin_nothing_resolves(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(arnold_agent, "_BRANDED_OMP", tmp_path / "missing")
+    monkeypatch.setattr(arnold_agent.shutil, "which", lambda name: None)
+
+    assert arnold_agent._resolve_omp_bin({}) is None
+
+
+@pytest.mark.parametrize("exit_code, supported", [(0, True), (2, False), (1, False)])
+def test_omp_supports_onboard_exit_codes(
+    tmp_path, exit_code, supported
+) -> None:
+    bin_ = _script_bin(tmp_path / "omp", exit_code=exit_code)
+
+    assert arnold_agent._omp_supports_onboard(str(bin_)) is supported
+
+
+def test_omp_supports_onboard_unknown_command_output_is_unsupported(
+    tmp_path,
+) -> None:
+    """Pre-onboard omp dispatchers exit 0 printing launch help for unknown
+    subcommands — that must NOT count as onboard support."""
+    bin_ = _script_bin(
+        tmp_path / "omp", exit_code=0, output="Unknown command: onboard"
+    )
+
+    assert arnold_agent._omp_supports_onboard(str(bin_)) is False
+
+
+def test_omp_supports_onboard_unexecutable_bin_is_unsupported(
+    tmp_path,
+) -> None:
+    bin_ = tmp_path / "omp"
+    bin_.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")  # not executable
+
+    assert arnold_agent._omp_supports_onboard(str(bin_)) is False

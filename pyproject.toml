@@ -1,0 +1,205 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "arnold"
+version = "0.23.0"
+description = "Arnold — AI agent harness for coordinating Claude and GPT to make and execute extremely robust plans, with Megaplan as the flagship planning pipeline plugin"
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+authors = [
+    { name = "Abdullah Formuli", email = "authrainmedia@gmail.com" },
+]
+keywords = ["ai", "planning", "orchestration", "claude", "codex", "arnold", "megaplan"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Topic :: Software Development :: Quality Assurance",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "pyyaml>=6.0",
+    "pydantic>=2.0",
+    "python-ulid>=3.0",
+    "psutil>=5.9",
+    # Resident/subagent workers validate source edits with this repository's
+    # supported `python -m pytest` workflow.  They run in the same editable
+    # Arnold interpreter, so the base install must include its test runner.
+    "pytest>=8.0",
+    # --- Hermes/agent backend (core) ---------------------------------------
+    # The hermes/agent runtime backs prep research, critique, fanout, and the
+    # agentic phases. It is NOT optional: the canonical prep models route to
+    # `hermes:deepseek:...` for every run, so a chain that does prep WILL import
+    # this backend. Historically these lived in the `[agent]` optional extra
+    # plus a `[tool.uv] default-extras = ["agent"]` hint, but some uv versions
+    # silently ignore `default-extras`, producing a fresh install that imports
+    # fine until prep iteration N fails with a confusing `agent_deps_missing`.
+    # Moving them into core makes `pip install -e .` / `uv pip install -e .`
+    # ALWAYS ship a working backend. (The `[agent]` extra below is kept as a
+    # back-compat alias for callers that still reference it.)
+    "openai",
+    "anthropic>=0.39.0",
+    "python-dotenv",
+    "fire",
+    "httpx",
+    "rich",
+    "requests",
+    "prompt_toolkit",
+    # --- omp (Oh My Pi) worker runtime -------------------------------------
+    # The omp RPC worker (megaplan/workers/omp.py) drives `omp --mode rpc`
+    # through the pinned omp_rpc Python client. Pinned to an immutable SHA of
+    # our fork (peteromallet/oh-my-pi, python/omp-rpc subdirectory) so clean
+    # machines and cloud builds resolve the same protocol version; the omp CLI
+    # itself is installed separately (bun/omp on PATH, from the same fork).
+    "omp-rpc @ git+https://github.com/peteromallet/oh-my-pi.git@ca1411b598273702c2e67cd127d44a2c52e48aac#subdirectory=python/omp-rpc",
+    "firecrawl-py",
+    "fal-client",
+    "edge-tts",
+    "faster-whisper>=1.0.0",
+    "PyJWT[crypto]",
+    "discord.py>=2.6,<3",
+    # --- Astrid epic runtime closure (shared-generation contract) ----------
+    # The shared generation venv is built ONLY from this frozen spec and is
+    # used by every epic's validation jobs. Astrid's runtime code imports
+    # these packages (jsonschema via astrid/core/theme/_schema.py,
+    # scenedetect/google-genai/pillow/xxhash via media/reference tooling,
+    # referencing as jsonschema's transitive core). Declaring them here keeps
+    # ANY regeneration of the shared venv content-convergent with the
+    # hand-augmented runtime; omitting them caused validation job VJ2 to exit
+    # 4 (pytest_collection_error: ModuleNotFoundError: jsonschema) after a
+    # spec-faithful rebuild dropped them. Pins mirror Astrid's own pyproject.
+    # banodoco-timeline-schema is a non-PyPI generation dependency declared
+    # in the local-only dev group below. Keeping it out of published project
+    # metadata preserves plain pip/wheel installs while uv and the pip-strategy
+    # generation builder install the vendored directory from the frozen lock.
+    "jsonschema>=4.0",
+    "referencing>=0.30",
+    "scenedetect[opencv-headless]==0.6.4",
+    "google-genai>=1.15.0",
+    "pillow>=12.2,<13",
+    "xxhash>=3.4",
+]
+
+[project.scripts]
+# `arnold` is the conversational agent (omp named-agent runner); the
+# workflow/operator tooling moved to `megaplan`.
+arnold = "agentbox.arnold_agent:main"
+megaplan = "arnold.cli:main"
+agentbox = "agentbox.cli:main"
+
+[project.optional-dependencies]
+db = [
+    "psycopg[binary]>=3.1",
+]
+# Back-compat alias: the agent backend's packages are now core dependencies
+# (see [project].dependencies). This extra is retained so existing install
+# commands / docs that say `pip install '.[agent]'` keep working as a no-op.
+agent = []
+
+[dependency-groups]
+dev = [
+    "banodoco-timeline-schema==0.0.2",
+]
+
+[tool.uv]
+# The hermes/agent backend's packages are now core [project].dependencies, so a
+# plain `uv pip install -e .` / `uv sync` always ships a working backend. We no
+# longer rely on `default-extras` (some uv versions silently ignore it, which is
+# what produced the confusing mid-prep `agent_deps_missing` failures).
+
+[tool.uv.sources]
+banodoco-timeline-schema = { path = "vendor/timeline-schema/python" }
+
+[tool.hatch.metadata]
+# The omp-rpc runtime is a direct git reference (pinned SHA) so clean
+# machines and cloud builds resolve the same protocol version.
+allow-direct-references = true
+
+[tool.hatch.build]
+exclude = [
+    "**/__pycache__/**",
+    "**/*.pyc",
+    "arnold/pipelines/**",
+    "docs/archive/**",
+    "tests/archive/**",
+    "tests/arnold/pipelines/megaplan/**",
+    "node_modules/**",
+    ".megaplan/**",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["arnold", "arnold_pipelines", "agentbox"]
+artifacts = [
+    "agentbox/py.typed",
+    "arnold/py.typed",
+    "arnold/*/py.typed",
+    "arnold_pipelines/py.typed",
+    "arnold_pipelines/megaplan/py.typed",
+    "arnold_pipelines/**/pipeline_ids.json",
+    "arnold_pipelines/megaplan/SKILL.md",
+    "arnold_pipelines/megaplan/skills/superfixer-debug/SKILL.md",
+    "arnold_pipelines/megaplan/skills/megaplan/SKILL.md",
+    "arnold_pipelines/megaplan/skills/subagent-launcher/SKILL.md",
+    "arnold_pipelines/megaplan/skills/megaplan-bakeoff/SKILL.md",
+    "arnold_pipelines/megaplan/skills/megaplan-cloud/SKILL.md",
+    "arnold_pipelines/megaplan/skills/megaplan-epic/SKILL.md",
+    "arnold_pipelines/megaplan/skills/megaplan-observe/SKILL.md",
+    "arnold_pipelines/megaplan/skills/megaplan-prep/SKILL.md",
+    "arnold_pipelines/megaplan/skills/megaplan-tickets/SKILL.md",
+    "arnold_pipelines/megaplan/skills/cleanup-loose-branches/SKILL.md",
+    "arnold_pipelines/megaplan/skills/fix-the-fixer/SKILL.md",
+    "arnold_pipelines/megaplan/skills/babysitting-principles/SKILL.md",
+    "arnold_pipelines/megaplan/skills/babysitter/SKILL.md",
+    "arnold_pipelines/megaplan/planning/skills/planning/SKILL.md",
+    "arnold_pipelines/pipelines/**/SKILL.md",
+    "arnold_pipelines/_template/**/SKILL.md",
+    "arnold_pipelines/evidence_pack/SKILL.md",
+    "arnold_pipelines/**/*.pypeline",
+    "arnold_pipelines/megaplan/skills/**/*.py",
+    "arnold_pipelines/megaplan/skills/fix-the-fixer/references/*.md",
+    "arnold_pipelines/megaplan/skills/fix-the-fixer/agents/*.yaml",
+    "arnold_pipelines/megaplan/strategy/CONTRACT.md",
+    "arnold_pipelines/megaplan/strategy/TEMPLATE.md",
+    "agentbox/systemd/*.service",
+    "agentbox/agents/*.md",
+    "agentbox/templates/resident/*",
+]
+exclude = [
+    "**/__pycache__/**",
+    "**/*.pyc",
+    "arnold/pipelines/**",
+    "arnold_pipelines/megaplan/cloud/_reference/**",
+    "arnold_pipelines/megaplan/agent/pyproject.toml",
+    "docs/archive/**",
+    "tests/archive/**",
+    "arnold_pipelines/megaplan/skills/babysit/**",
+    ".megaplan/**",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "--import-mode=importlib"
+filterwarnings = [
+    # discord.py 2.7.x imports stdlib audioop on Python 3.11/3.12 and already
+    # depends on audioop-lts for Python 3.13+.  Keep every other warning fatal
+    # in the release proof while suppressing only this upstream transition.
+    "ignore:'audioop' is deprecated and slated for removal in Python 3.13:DeprecationWarning:discord.player",
+]
+python_files = ["test_*.py", "editorial_*.py"]
+norecursedirs = ["tests/archive", "tests/arnold/pipelines/deliberation", ".*", "build", "dist", "CVS", "_darcs", "{arch}", "*.egg"]
+markers = [
+    "asyncio: async tests, primarily for the vendored agent runtime",
+    "conformance: opt-in live conformance tests that require external authenticated CLIs",
+    "integration: integration tests that may exercise external process boundaries",
+    "slow: tests that require Docker or other external runtime dependencies",
+    "crash_isolation: tests verifying crash isolation between subprocess drivers",
+    "version_skew: tests verifying compatibility across version skew scenarios",
+    "hinge_gate: gate test for the M3 hinge (R1 authority flip)",
+    "substrate_swap: M4 oracle tests that must remain green under substrate substitution (lease/budget/journal swap)",
+    "replay_oracle: M5c replay tests that capture legacy control outputs and opt into routed parity action by action",
+    "m8_benchmark: M8 acceptance-gate benchmark tests (opt-in, width-32 thresholds)",
+    "wheel_smoke: build and install wheel/sdist into a clean venv",
+]

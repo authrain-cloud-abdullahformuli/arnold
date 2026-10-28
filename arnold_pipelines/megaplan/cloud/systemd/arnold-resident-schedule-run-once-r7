@@ -1,0 +1,165 @@
+#!/usr/bin/env bash
+# ============================================================================
+# arnold-resident-schedule-run-once-r7 — manifest-only schedule runner
+#
+# Provenance: replaces the box's broken /usr/local/bin/arnold-resident-
+# schedule-run-once-r6 (2026-08-07). r6 hardcoded expected_head=234ac3524... in
+# its body; the box tree HEAD moves under the live repair-loop (the census
+# observed it advance 87a912beb -> 49af598c0 mid-census), so the baked SHA went
+# stale and the one-minute systemd timer failed every minute with exit 1 while
+# the REAL scheduling ran out-of-band (an ad-hoc 120s bash loop).
+#
+# This runner resolves BOTH runtime_root and expected_head from the per-runtime
+# manifest ONLY (fixer-unification design rule 3 — the manifest is the ONLY
+# post-bootstrap runtime resolver; Phase-2 target landed in P5). There is
+# deliberately NO hardcoded pin, NO env override and NO pin file: a SHA baked
+# into the script body (r6) or an operator pin file (r7's interim form) cannot
+# track a live tree, which is exactly the failure this runner replaces. The
+# manifest's epic.runtime_root + epic.expected_head are the pin; missing or
+# invalid manifest => exit 2 (fail loudly). It never silently proceeds
+# unpinned and never falls back to the tree's own HEAD — that would disable
+# the drift guard, which is the point of the check.
+#
+# Manifest path: ${ARNOLD_RUNTIME_MANIFEST:-/workspace/.megaplan/runtime-manifest.json}
+# (one stable bootstrap path, matching runtime_manifest.active_manifest_path()
+# and the supervisor-lib helper). A compatibility_only pointer is
+# NON-AUTHORITATIVE telemetry (G2) and is refused — it can never select a
+# runtime.
+#
+# Test-only escape hatch: ARNOLD_SCHEDULE_SKIP_DOCKER_CHECK=1 skips the docker
+# container-liveness check (used by tests/cloud/test_schedule_runner_pin.py).
+# ============================================================================
+set -euo pipefail
+
+manifest_file="${ARNOLD_RUNTIME_MANIFEST:-/workspace/.megaplan/runtime-manifest.json}"
+container="${MEGAPLAN_RESIDENT_CONTAINER:-megaplan-cloud-agent-resident-only}"
+dependency_root="/workspace/.megaplan/resident-deps"
+
+# --- runtime identity resolution: the runtime manifest ONLY -------------------
+# NOTE: resolved BEFORE .cloud-hot-env sourcing (below) so runtime_root +
+# expected_head always come from the unit's manifest binding (systemd
+# Environment= / drop-in), never from hot-env, which the design moves to
+# credentials-only.
+if [[ ! -f "$manifest_file" ]]; then
+    echo "schedule-run-once: runtime manifest '$manifest_file' missing — set ARNOLD_RUNTIME_MANIFEST or deploy the manifest at the bootstrap path" >&2
+    exit 2
+fi
+if ! manifest_values="$(python3 - "$manifest_file" <<'PY' 2>/dev/null
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+try:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+except Exception:
+    sys.exit(1)
+if not isinstance(payload, dict):
+    sys.exit(1)
+# A compatibility_only pointer is NON-AUTHORITATIVE telemetry (G2): every
+# resolver treats it as ABSENT for admission — refuse to select from it.
+if payload.get("compatibility_only") is True:
+    sys.exit(1)
+epic = payload.get("epic")
+if not isinstance(epic, dict):
+    sys.exit(1)
+root = str(epic.get("runtime_root") or "").strip()
+head = str(epic.get("expected_head") or "").strip()
+if not root or not head:
+    sys.exit(1)
+print(root)
+print(head)
+PY
+)"; then
+    echo "schedule-run-once: runtime manifest '$manifest_file' invalid, non-authoritative (compatibility_only), or missing epic.runtime_root/epic.expected_head" >&2
+    exit 2
+fi
+runtime_root="$(printf '%s\n' "$manifest_values" | sed -n '1p')"
+expected_head="$(printf '%s\n' "$manifest_values" | sed -n '2p')"
+if ! printf '%s\n' "$expected_head" | grep -Eq '^[0-9a-f]{40}$'; then
+    echo "schedule-run-once: manifest '$manifest_file' epic.expected_head is not a 40-hex git SHA: '$expected_head'" >&2
+    exit 2
+fi
+if [[ "$runtime_root" != /* ]]; then
+    echo "schedule-run-once: manifest '$manifest_file' epic.runtime_root is not an absolute path: '$runtime_root'" >&2
+    exit 2
+fi
+
+# --- git drift guards (same as r6: pinned HEAD + clean tree) ------------------
+actual_head="$(git -C "$runtime_root" rev-parse HEAD 2>/dev/null || true)"
+if [[ -z "$actual_head" ]]; then
+    echo "schedule-run-once: cannot resolve HEAD of runtime_root '$runtime_root' (not a git repository?)" >&2
+    exit 1
+fi
+if [[ "$actual_head" != "$expected_head" ]]; then
+    echo "schedule-run-once: runtime_root HEAD drift — actual: $actual_head, pinned: $expected_head" >&2
+    exit 1
+fi
+if [[ -n "$(git -C "$runtime_root" status --porcelain --untracked-files=no)" ]]; then
+    echo "schedule-run-once: runtime_root '$runtime_root' has uncommitted changes; refusing to run" >&2
+    exit 1
+fi
+
+# --- container liveness check (same guard as r6) --------------------------------
+if [[ "${ARNOLD_SCHEDULE_SKIP_DOCKER_CHECK:-0}" != "1" ]]; then
+    if [[ "$(docker inspect -f '{{.State.Running}}' "$container" 2>/dev/null || true)" != "true" ]]; then
+        echo "schedule-run-once: container '$container' is not running (docker inspect failed or State.Running != true)" >&2
+        exit 1
+    fi
+fi
+
+# --- environment ------------------------------------------------------------------
+set -a
+if [[ -f /workspace/.cloud-hot-env ]]; then
+    # shellcheck disable=SC1091
+    . /workspace/.cloud-hot-env
+fi
+set +a
+export CODEX_HOME=/workspace/.codex
+export ARNOLD_RESIDENT_UNBOUNDED_REQUEST=1
+umask 077
+
+# --- dependency roots + auth guards ------------------------------------------
+for dep in fire openai requests; do
+    if [[ ! -f "$dependency_root/$dep/__init__.py" ]]; then
+        echo "schedule-run-once: missing dependency root $dependency_root/$dep/__init__.py" >&2
+        exit 1
+    fi
+done
+if [[ ! -s "$CODEX_HOME/auth.json" ]]; then
+    echo "schedule-run-once: $CODEX_HOME/auth.json missing or empty" >&2
+    exit 1
+fi
+# Expiry guard (grok consult 2026-08-17): a non-empty auth.json can still
+# hold an EXPIRED id_token (the Jul-29 stale auth at /workspace/.codex caused
+# 401 connection_error on every codex child until the deepseek swarm found
+# it). Decode the id_token exp and fail closed when it is in the past, so a
+# stale credential never dispatches a doomed codex worker.
+if ! python3 - "$CODEX_HOME/auth.json" 2>/dev/null <<'PY'
+import base64
+import json
+import sys
+import time
+
+try:
+    auth = json.load(open(sys.argv[1]))
+    tokens = auth.get("tokens") or {}
+    idt = tokens.get("id_token") or ""
+    if not idt:
+        sys.exit(1)
+    payload = idt.split(".")[1]
+    payload += "=" * (-len(payload) % 4)
+    claims = json.loads(base64.urlsafe_b64decode(payload))
+    exp = int(claims.get("exp") or 0)
+    if exp <= time.time():
+        sys.exit(1)
+except Exception:
+    sys.exit(1)
+PY
+then
+    echo "schedule-run-once: $CODEX_HOME/auth.json id_token expired or unreadable" >&2
+    exit 1
+fi
+
+# --- dispatch (mirrors r6's exec invocation) ------------------------------------
+docker exec "$container" bash -lc "env -u PYTHONHOME PYTHONSAFEPATH=1 PYTHONPATH=\"$dependency_root:$runtime_root\" python -P -m arnold_pipelines.megaplan resident schedule --store-root /workspace/arnold/.megaplan/resident --mode production run-once"

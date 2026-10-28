@@ -1,0 +1,41 @@
+# `partnered-5-glm` is GLM-led and keeps every Execute route in the GLM
+# family.  DeepSeek remains deliberately scoped to prep/critique only; gate now routes through GLM-5.2.
+# Finalization is deliberately pinned to GPT-5.6 Sol at high reasoning because
+# it must compile the planning result into the exact execution contract.
+# Finalize remains the sole Codex route.  Execute prefers direct Zhipu GLM
+# 5.2, falls back to Fireworks GLM 5p2, then retries the direct route.
+[profiles.partnered-5-glm]
+adaptive_critique = true
+plan                  = "omp:zai/glm-5.2"
+prep                  = "omp:deepseek/deepseek-v4-pro"
+critique              = "omp:deepseek/deepseek-v4-pro"
+critique_evaluator    = "omp:zai/glm-5.2"
+revise                = "omp:zai/glm-5.2"
+gate                  = "omp:zai/glm-5.2"
+finalize              = "codex:gpt-5.6-sol:high"
+execute               = "omp:zai/glm-5.2"
+feedback              = "omp:zai/glm-5.2"
+loop_plan             = "omp:zai/glm-5.2"
+loop_execute          = "omp:zai/glm-5.2"
+review                = "omp:zai/glm-5.2"
+tiebreaker_researcher = "omp:zai/glm-5.2"
+tiebreaker_challenger = "omp:zai/glm-5.2"
+
+[profiles.partnered-5-glm.tier_models.execute]
+1 = ["omp:zai/glm-5.2", "omp:fireworks/glm-5.2", "omp:zai/glm-5.2"]
+2 = ["omp:zai/glm-5.2", "omp:fireworks/glm-5.2", "omp:zai/glm-5.2"]
+3 = ["omp:zai/glm-5.2", "omp:fireworks/glm-5.2", "omp:zai/glm-5.2"]
+4 = ["omp:zai/glm-5.2", "omp:fireworks/glm-5.2", "omp:zai/glm-5.2"]
+5 = ["omp:zai/glm-5.2", "omp:fireworks/glm-5.2", "omp:zai/glm-5.2"]
+6 = ["omp:zai/glm-5.2", "omp:fireworks/glm-5.2", "omp:zai/glm-5.2"]
+7 = ["omp:zai/glm-5.2", "omp:fireworks/glm-5.2", "omp:zai/glm-5.2"]
+8 = ["omp:zai/glm-5.2", "omp:fireworks/glm-5.2", "omp:zai/glm-5.2"]
+9 = ["omp:zai/glm-5.2", "omp:fireworks/glm-5.2", "omp:zai/glm-5.2"]
+10 = ["omp:zai/glm-5.2", "omp:fireworks/glm-5.2", "omp:zai/glm-5.2"]
+
+[profiles.partnered-5-glm.tier_models.critique]
+1 = "omp:deepseek/deepseek-v4-flash"
+2 = "omp:deepseek/deepseek-v4-pro"
+3 = "omp:deepseek/deepseek-v4-pro"
+4 = ["omp:zai/glm-5.2", "omp:fireworks/glm-5.2", "omp:zai/glm-5.2"]
+5 = "omp:zai/glm-5.2"

@@ -1,0 +1,147 @@
+#!/usr/bin/env bash
+# Ensure the Discord resident tmux session is alive in the cloud container.
+# Mirrors ensure-megaplan-watchdog: idempotent, host-side, fired by a 5-min
+# systemd timer. This is the "never dark" guarantee — the resident self-heals
+# within ~5 min of any disruption (container restart/crash/OOM/image swap),
+# independent of whether the entrypoint happened to start it.
+set -u
+
+CONTAINER="${MEGAPLAN_CLOUD_CONTAINER:-megaplan-cloud-agent}"
+LOG="${MEGAPLAN_RESIDENT_ENSURE_LOG:-/var/log/megaplan-resident-ensure.log}"
+SESSION=megaplan-resident-discord
+
+now() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
+log() { printf "[%s] %s\n" "$(now)" "$*" >> "$LOG"; }
+
+resident_healthy() {
+  docker exec "$CONTAINER" bash -lc '
+    set -euo pipefail
+    . /usr/local/bin/arnold-supervisor-runtime-lib 2>/dev/null || true
+    marker_dir="${MEGAPLAN_RESIDENT_MARKER_DIR:-/workspace/.megaplan/cloud-sessions}"
+    arnold_supervisor_bind_signal_context_for_session megaplan-resident-discord "$marker_dir" non_worker
+    tmux_socket="$(arnold_supervisor_tmux_session_socket megaplan-resident-discord)"
+    tmux -S "$tmux_socket" has-session -t =megaplan-resident-discord
+    owned_pane="$(arnold_supervisor_tmux_owned_pane megaplan-resident-discord "$MEGAPLAN_NBF_MARKER_PATH" "$tmux_socket")"
+    IFS='|' read -r _owned_pane_id pane_pid _owned_pane_start _owned_command_digest <<< "$owned_pane"
+    tr "\0" "\n" < "/proc/$pane_pid/cmdline" | grep -Fx -- "--store-root" >/dev/null
+    set -a
+    . /workspace/.secrets/megaplan-resident-discord.env
+    [[ ! -f /workspace/.cloud-hot-env ]] || . /workspace/.cloud-hot-env
+    [[ ! -f /workspace/.megaplan/resident-runtime.env ]] || . /workspace/.megaplan/resident-runtime.env
+    set +a
+    # The resident runtime root resolves from the per-session manifest
+    # (ARNOLD_RUNTIME_MANIFEST -> epic.runtime_root). No shared-root literal
+    # and no env-selector read (G5): an unbound/corrupt manifest fails the
+    # health check, and the restart path below fails closed the same way.
+    if [[ -f /usr/local/bin/arnold-supervisor-runtime-lib ]]; then
+      . /usr/local/bin/arnold-supervisor-runtime-lib
+    fi
+    runtime_src="$(arnold_runtime_manifest_epic_field epic.runtime_root 2>/dev/null || true)"
+    [[ -n "$runtime_src" && -d "$runtime_src" ]]
+    runtime_python="${MEGAPLAN_RUNTIME_PYTHON:-python}"
+    store_root="${MEGAPLAN_RESIDENT_STORE_ROOT:-$runtime_src/.megaplan/resident}"
+    [[ "$runtime_python" == */* ]] && [[ -x "$runtime_python" ]]
+    [[ "$(readlink -f "/proc/$pane_pid/exe")" == "$(readlink -f "$runtime_python")" ]]
+    tr "\0" "\n" < "/proc/$pane_pid/environ" |
+      grep -F -- "PYTHONPATH=$runtime_src:" >/dev/null
+    tr "\0" "\n" < "/proc/$pane_pid/environ" |
+      grep -Fx -- "MEGAPLAN_RUNTIME_PYTHON=$runtime_python" >/dev/null
+    PYTHONSAFEPATH=1 PYTHONPATH="$runtime_src:${PYTHONPATH:-}" \
+      "$runtime_python" -P -m arnold_pipelines.megaplan resident health \
+        --mode "${MEGAPLAN_RESIDENT_MODE:-production}" \
+        --store-root "$store_root" >/dev/null
+  ' >/dev/null 2>&1
+}
+
+if ! docker inspect "$CONTAINER" >/dev/null 2>&1; then
+  log "container_missing container=$CONTAINER"
+  exit 1
+fi
+
+running="$(docker inspect -f "{{.State.Running}}" "$CONTAINER" 2>/dev/null || echo false)"
+if [[ "$running" != "true" ]]; then
+  # Don't fight a stopped/restarting container — the watchdog-ensure service
+  # owns starting it. Retry next tick.
+  log "container_not_running container=$CONTAINER"
+  exit 0
+fi
+
+if resident_healthy; then
+  log "resident_alive container=$CONTAINER"
+  exit 0
+fi
+
+if docker exec "$CONTAINER" bash -lc '. /usr/local/bin/arnold-supervisor-runtime-lib 2>/dev/null || true; socket="$(arnold_supervisor_tmux_session_socket megaplan-resident-discord)"; tmux -S "$socket" has-session -t =megaplan-resident-discord' >/dev/null 2>&1; then
+  log "resident_unhealthy restarting container=$CONTAINER"
+  # Bind the tmux session teardown to its current pane process. The canonical
+  # bridge owns durable confirmation, identity revalidation, and
+  # record-before-signal; tmux cleanup happens only after that proof succeeds.
+  docker exec "$CONTAINER" bash -lc '
+    set -u
+    lib=/usr/local/bin/arnold-supervisor-runtime-lib
+    [[ -f "$lib" ]] || lib=/workspace/arnold/arnold_pipelines/megaplan/cloud/wrappers/arnold-supervisor-runtime-lib
+    [[ -f "$lib" ]] || { echo resident_signal_runtime_missing >&2; exit 78; }
+    . "$lib"
+    arnold_supervisor_runtime_init ensure-megaplan-resident /workspace/arnold || exit $?
+    marker_dir="${MEGAPLAN_RESIDENT_MARKER_DIR:-/workspace/.megaplan/cloud-sessions}"
+    arnold_supervisor_bind_signal_context_for_session megaplan-resident-discord "$marker_dir" non_worker || exit 78
+    session_snapshot="$(arnold_supervisor_tmux_session_snapshot megaplan-resident-discord)" || exit 78
+    IFS=$'	' read -r tmux_socket tmux_socket_fingerprint tmux_server_pid tmux_server_start tmux_session_id tmux_session_name tmux_pane_records tmux_pane_digest <<< "$session_snapshot"
+    owned_pane="$(arnold_supervisor_tmux_owned_pane megaplan-resident-discord "$MEGAPLAN_NBF_MARKER_PATH" "$tmux_socket")" || exit 78
+    IFS='|' read -r tmux_pane_id pane_pid tmux_pane_start tmux_command_digest <<< "$owned_pane"
+    [[ "$tmux_session_name" == "megaplan-resident-discord" ]] || exit 78
+    [[ "$pane_pid" =~ ^[0-9]+$ ]] || exit 78
+    arnold_supervisor_signal_bound_pid ensure-megaplan-resident "$pane_pid" SIGTERM term resident-unhealthy
+    rc=$?
+    [[ "$rc" -eq 0 ]] || exit "$rc"
+    sleep 2
+    arnold_supervisor_signal_bound_pid ensure-megaplan-resident "$pane_pid" SIGKILL kill resident-unhealthy
+    rc=$?
+    [[ "$rc" -eq 0 ]] || exit "$rc"
+    arnold_supervisor_tmux_session_revalidate megaplan-resident-discord \
+      "$tmux_socket" "$tmux_socket_fingerprint" "$tmux_server_pid" "$tmux_server_start" \
+      "$tmux_session_id" "$tmux_session_name" "$tmux_pane_digest" || exit 78
+    tmux -S "$tmux_socket" kill-session -t "=$tmux_session_id" >/dev/null 2>&1 || exit 78
+    if tmux -S "$tmux_socket" has-session -t "=$tmux_session_id" >/dev/null 2>&1; then
+      exit 78
+    fi
+  ' 2>>"$LOG"
+  signal_rc=$?
+  if [[ "$signal_rc" -eq 75 ]]; then
+    log "resident_signal_confirmation_pending container=$CONTAINER"
+    exit 0
+  fi
+  if [[ "$signal_rc" -ne 0 ]]; then
+    log "resident_signal_blocked container=$CONTAINER rc=$signal_rc"
+    exit 1
+  fi
+else
+  log "resident_missing starting container=$CONTAINER"
+fi
+# Canonical resident launch (mirrors entrypoint.sh.tmpl). The heredoc is quoted
+# ('EOS') so \$ and \${...} stay literal until the resident's bash -lc expands
+# them AFTER sourcing the env — exactly like the entrypoint's invocation.
+if docker exec -i "$CONTAINER" bash >>"$LOG" 2>&1 <<'EOS'; then
+  set -u
+  if [ ! -f /workspace/.secrets/megaplan-resident-discord.env ]; then
+    echo "resident_env_missing"
+    exit 0
+  fi
+  socket="$(arnold_supervisor_tmux_session_socket megaplan-resident-discord 2>/dev/null || true)"
+  if [[ -n "$socket" ]] && tmux -S "$socket" has-session -t =megaplan-resident-discord 2>/dev/null; then
+    echo "resident_already_up"
+    exit 0
+  fi
+  [[ -n "$socket" ]] || { echo resident_tmux_socket_unbound; exit 78; }
+  tmux -S "$socket" new-session -d -s megaplan-resident-discord -c /workspace "bash -lc 'set -a; . /workspace/.secrets/megaplan-resident-discord.env; [[ ! -f /workspace/.cloud-hot-env ]] || . /workspace/.cloud-hot-env; [[ ! -f /workspace/.megaplan/resident-runtime.env ]] || . /workspace/.megaplan/resident-runtime.env; set +a; if [[ -f /usr/local/bin/arnold-supervisor-runtime-lib ]]; then . /usr/local/bin/arnold-supervisor-runtime-lib; fi; runtime_src=\"\$(arnold_runtime_manifest_epic_field epic.runtime_root 2>/dev/null || true)\"; [[ -n \"\$runtime_src\" && -d \"\$runtime_src\" ]] || { echo resident_runtime_unbound; exit 78; }; runtime_python=\${MEGAPLAN_RUNTIME_PYTHON:-python}; store_root=\${MEGAPLAN_RESIDENT_STORE_ROOT:-\$runtime_src/.megaplan/resident}; cd \"\$runtime_src\"; export PYTHONPATH=\$runtime_src:\${PYTHONPATH:-}; export MEGAPLAN_RESIDENT_DISCORD_BOT_ROLE=\${MEGAPLAN_RESIDENT_DISCORD_BOT_ROLE:-production}; echo [resident-start] \$(date -Iseconds) provider=\${MEGAPLAN_RESIDENT_MODEL_PROVIDER} model=\${MEGAPLAN_RESIDENT_MODEL} store_root=\$store_root >> /workspace/megaplan-resident-discord.log; exec \"\$runtime_python\" -P -m arnold_pipelines.megaplan resident discord --mode \${MEGAPLAN_RESIDENT_MODE:-production} --store-root \"\$store_root\" >> /workspace/megaplan-resident-discord.log 2>&1'"
+  echo "resident_started"
+EOS
+  sleep 5
+  if resident_healthy; then
+    log "resident_restarted container=$CONTAINER"
+    exit 0
+  fi
+fi
+
+log "resident_restart_failed_not_alive container=$CONTAINER"
+exit 1

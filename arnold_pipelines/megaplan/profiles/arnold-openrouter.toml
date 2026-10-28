@@ -1,0 +1,16 @@
+# Arnold epic launch profile — routes EVERY role through OpenRouter (the only key present).
+# DeepSeek-R1 (reasoning) for plan/critique/revise/execute/review; DeepSeek-chat for light roles.
+[profiles.arnold-openrouter]
+plan     = "omp:openrouter/deepseek/deepseek-r1"
+prep     = "omp:openrouter/deepseek/deepseek-chat"
+critique = "omp:openrouter/deepseek/deepseek-r1"
+revise   = "omp:openrouter/deepseek/deepseek-r1"
+gate     = "omp:openrouter/deepseek/deepseek-chat"
+finalize = "omp:openrouter/deepseek/deepseek-r1"
+execute  = "omp:openrouter/deepseek/deepseek-r1"
+review   = "omp:openrouter/deepseek/deepseek-r1"
+feedback = "omp:openrouter/deepseek/deepseek-chat"
+loop_plan    = "omp:openrouter/deepseek/deepseek-r1"
+loop_execute = "omp:openrouter/deepseek/deepseek-r1"
+tiebreaker_researcher = "omp:openrouter/deepseek/deepseek-r1"
+tiebreaker_challenger = "omp:openrouter/deepseek/deepseek-r1"

@@ -1,0 +1,158 @@
+"""Pure scope-drift computation for execute receipts."""
+
+from __future__ import annotations
+
+import subprocess
+from dataclasses import dataclass
+from fnmatch import fnmatch
+from pathlib import Path
+from typing import Literal
+
+BENIGN_PATTERNS = (
+    ".megaplan/**",
+    ".vscode/**",
+    ".idea/**",
+    ".editorconfig",
+    "execution.json",
+    "final.md",
+    "review.json",
+    "*.meta.json",
+    "package-lock.json",
+    "uv.lock",
+    "poetry.lock",
+    "yarn.lock",
+    "Cargo.lock",
+    "step_receipt_*.json",
+    "*.bak",
+    "*.orig",
+    "*.rej",
+)
+
+
+@dataclass
+class ScopeDriftReport:
+    files_added: list[str]
+    files_missing: list[str]
+    loc_added: int
+    loc_removed: int
+    loc_added_outside_claimed: int
+    severity: Literal["none", "low", "high"]
+
+
+def _is_benign(path: str) -> bool:
+    normalized = path.replace("\\", "/")
+    return any(fnmatch(normalized, pattern) for pattern in BENIGN_PATTERNS)
+
+
+def compute_scope_drift(
+    *,
+    files_claimed: set[str],
+    files_in_diff: set[str],
+    loc_by_file: dict[str, int],
+    files_claimed_for_missing: set[str] | None = None,
+) -> ScopeDriftReport:
+    files_added = sorted(path for path in files_in_diff - files_claimed if not _is_benign(path))
+    # ``files_missing`` (claimed-but-not-in-diff = fabrication / wrong-tree) is a
+    # PER-CALL signal. In per-batch execute mode the caller unions every batch's
+    # claims into ``files_claimed`` to suppress false ``files_added``; but a file
+    # legitimately changed in one batch and reverted/superseded in a later batch
+    # is absent from the final diff by design, so the union must NOT drive
+    # ``files_missing``. Callers pass ``files_claimed_for_missing`` (this call's
+    # own claims only); it defaults to ``files_claimed`` for single-call callers.
+    missing_baseline = (
+        files_claimed if files_claimed_for_missing is None else files_claimed_for_missing
+    )
+    files_missing = sorted(
+        path for path in missing_baseline - files_in_diff if not _is_benign(path)
+    )
+    loc_added = sum(loc_by_file.values())
+    loc_added_outside_claimed = sum(loc_by_file.get(path, 0) for path in files_added)
+    # ``files_missing`` means the executor claimed it changed a file that
+    # isn't in the diff — i.e. fabricated work, or work that landed in the
+    # wrong tree (sandbox escape).  Treat this at least as seriously as
+    # writes-without-claims: low for any miss, high once the count is
+    # comparable to a real-but-noisy diff (>3 files claimed-but-missing
+    # is well past "model forgot to list one").
+    if files_added and loc_added_outside_claimed > 20:
+        severity: Literal["none", "low", "high"] = "high"
+    elif len(files_missing) > 3:
+        severity = "high"
+    elif files_added or loc_added_outside_claimed > 0 or files_missing:
+        severity = "low"
+    else:
+        severity = "none"
+    return ScopeDriftReport(
+        files_added=files_added,
+        files_missing=files_missing,
+        loc_added=loc_added,
+        loc_removed=0,
+        loc_added_outside_claimed=loc_added_outside_claimed,
+        severity=severity,
+    )
+
+
+def _parse_numstat_count(value: str) -> int:
+    try:
+        return int(value)
+    except ValueError:
+        return 0
+
+
+def collect_loc_by_file(project_dir: Path, candidate_paths: set[str]) -> dict[str, int]:
+    """Return added LOC by changed path, including untracked files.
+
+    A tracked file that is CLEAN in the working tree (no diff vs HEAD) has
+    ZERO added lines: the numstat produces no row for it and the fallback must
+    NOT count the full file.  Counting committed-clean files as fully-added
+    inflated ``loc_added_outside_claimed`` and made the scope-drift gate trip
+    ``high`` on every closeout for milestone-window files that were committed
+    by the fixer/repair lineage but claimed by no task (permanent
+    ``blocked_by_quality``).  Only UNTRACKED files (no numstat row AND not
+    tracked at HEAD) fall back to a full-file line count.
+    """
+    if not candidate_paths:
+        return {}
+    loc_by_file: dict[str, int] = {}
+    paths = sorted(candidate_paths)
+    try:
+        result = subprocess.run(
+            ["git", "diff", "--numstat", "HEAD", "--", *paths],
+            cwd=project_dir,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+    except Exception:
+        result = None
+    if result is not None and result.returncode == 0:
+        for line in result.stdout.splitlines():
+            parts = line.split("\t")
+            if len(parts) < 3:
+                continue
+            added, _removed, path = parts[0], parts[1], parts[2]
+            loc_by_file[path] = _parse_numstat_count(added)
+    try:
+        tracked = set(
+            subprocess.run(
+                ["git", "ls-files", "--", *paths],
+                cwd=project_dir,
+                text=True,
+                capture_output=True,
+                check=False,
+            ).stdout.splitlines()
+        )
+    except Exception:
+        tracked = set()
+    for path in paths:
+        if path in loc_by_file:
+            continue
+        if path in tracked:
+            # Tracked but no numstat row -> committed-clean (or intent-to-add
+            # with no content): zero added lines, never the full file.
+            loc_by_file[path] = 0
+            continue
+        try:
+            loc_by_file[path] = (project_dir / path).read_text(encoding="utf-8").count("\n")
+        except Exception:
+            loc_by_file[path] = 0
+    return loc_by_file
